@@ -1,0 +1,14 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: thanos-sc-crt
+  namespace: cattle-monitoring-system
+spec:
+  secretName: thanos-sc-crt
+  commonName: thanos.homelabs.local
+  dnsNames:
+    - thanos.homelabs.local
+  isCA: true
+  issuerRef:
+    name: thanos-ca-issuer
+    kind: Issuer

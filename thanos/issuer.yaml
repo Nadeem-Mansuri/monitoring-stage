@@ -1,0 +1,8 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: thanos-ca-issuer
+  namespace: cattle-monitoring-system
+spec:
+  ca:
+    secretName: thanos-ca-key-pair

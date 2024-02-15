@@ -1,0 +1,13 @@
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm show values bitnami/metallb > matallb-values.yaml
+helm install metallb bitnami/metallb --namespace metallb-system --values matallb-values.yaml --create-namespace
+
+
+
+kubectl get ipaddresspools.metallb.io -A
+kubectl describe ipaddresspools.metallb.io first-pool -n metallb-system
+
+kubectl get l2advertisements.metallb.io -n metallb-system
+kubectl describe l2advertisements.metallb.io -n metallb-system
+kubectl get crds|grep metallb
+

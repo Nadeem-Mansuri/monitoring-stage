@@ -1,0 +1,28 @@
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    externalLabels:
+      cluster: cluster1
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 60Gi
+    thanos:
+      image: "quay.io/thanos/thanos:v0.24.0"
+      version: v0.24.0
+      objectStorageConfig:
+        existingSecret:
+          name: "thanos"
+          key: "thanos-object-store.yaml"
+  thanosService:
+    enabled: true
+    ## HTTP port config for thanos sidecar metrics
+    httpPortName: http
+    httpPort: 10902
+    targetHttpPort: "http"
+    ## Port to expose on each node, if service type is NodePort
+    httpNodePort: 30902

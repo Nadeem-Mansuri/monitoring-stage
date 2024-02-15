@@ -1,0 +1,49 @@
+kubeVersionOverride: "v1.23.0"
+defaultRules:
+  rules:
+    alertmanager: false
+    etcd: false
+    kubeApiserver: false
+    kubeApiserverAvailability: false
+    kubeApiserverError: false
+    kubeApiserverSlos: false
+    kubeScheduler: false
+prometheus:
+  prometheusSpec:
+    logLevel: debug
+    replicas: 1
+    externalLabels:
+      cluster: cluster1
+    retention: 2d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+    thanos:
+      image: "quay.io/thanos/thanos:v0.20.0"
+      version: v0.20.0
+      objectStorageConfig:
+        name: thanos
+        key: thanos-object-store.yaml
+
+  thanosService:
+    enabled: true
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+alertmanager:
+  enabled: false
+prometheusOperator:
+  admissionWebhooks:
+    patch:
+      image:
+        repository: k8s.gcr.io/ingress-nginx/kube-webhook-certgen
+        tag: v1.0
+        pullPolicy: IfNotPresent

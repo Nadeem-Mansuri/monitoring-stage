@@ -1,0 +1,22 @@
+first remove-
+kubectl delete validatingwebhookconfigurations ingress-nginx-admission
+kubectl delete  sa -n ingress-nginx ingress-nginx
+kubectl delete  sa -n ingress-nginx ingress-nginx-admission
+kubectl delete  sa -n ingress-nginx default
+kubectl delete ConfigMap -n ingress-nginx ingress-nginx-controller
+kubectl delete role  -n ingress-nginx  ingress-nginx
+kubectl delete role  -n ingress-nginx ingress-nginx-admission
+kubectl delete rolebinding  -n ingress-nginx ingress-nginx
+kubectl delete IngressClass nginx -n ingress-nginx
+
+kubectl delete svc ingress-nginx-controller-admission -n ingress-nginx
+kubectl delete daemonset.apps/nginx-ingress-controller -n ingress-nginx
+kubectl get all -n ingress-nginx
+
+
+helm upgrade --install ingress-nginx ingress-nginx   --repo https://kubernetes.github.io/ingress-nginx   --namespace ingress-nginx --create-namespace --values ingress-nginx-values.yaml
+
+
+==bitnami Ingress===
+helm upgrade --install=true --namespace=cattle-monitoring-system nginx-monitoring bitnami/nginx-ingress-controller -f nginx-ingress-controller-values.yaml --create-namespace
+

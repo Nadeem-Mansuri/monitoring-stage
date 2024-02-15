@@ -1,0 +1,39 @@
+prometheus:
+  prometheusSpec:
+    replicas: 2
+    externalLabels:
+      cluster: <unique name>
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 25Gi
+    thanos:
+      image: "quay.io/thanos/thanos:v0.20.0"
+      version: v0.20.0
+      objectStorageConfig:
+        name: thanos
+        key: thanos-object-store.yaml
+  thanosService:
+    enabled: true
+  thanosIngress:
+    enabled: true
+    ingressClassName: "nginx"
+    hosts:
+      - thanos-homelabs.local
+    annotations:
+      kubernetes.io/ingress.class: "nginx"
+      nginx.ingress.kubernetes.io/backend-protocol: GRPC
+      nginx.ingress.kubernetes.io/force-ssl-redirect: 'true'
+      nginx.ingress.kubernetes.io/grpc-backend: 'true'
+    tls:
+     - secretName: thanos-sc-crt
+       hosts:
+       - thanos-homelabs.local
+  additionalAlertManagerConfigs:
+      - scheme: 'https'
+        api_version: v2
+        static_configs:
+          - targets: ['alrtmgr.grafana.stg.cloud.synchronoss.net:443']

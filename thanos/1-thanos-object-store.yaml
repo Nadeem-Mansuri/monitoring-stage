@@ -1,0 +1,17 @@
+#1-thanos-object-store
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: cattle-monitoring-system
+  name: objstore
+  stringData:
+    objstore.yml: |-
+      type: S3
+      config:
+        bucket: data-bucket-1
+        endpoint: "minio.minio:9000"
+        insecure: true
+        access_key: "zAMiyUijFC3QZOPCPCH3"
+        secret_key: "yLP23klTcPFsK6IXIA0kGkHX8DbP9jETPMZuXeh2"

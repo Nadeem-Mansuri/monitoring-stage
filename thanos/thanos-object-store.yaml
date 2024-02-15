@@ -1,0 +1,7 @@
+type: S3
+config:
+  endpoint: "10.43.249.92:9000"
+  insecure: true
+  bucket: "object-storage-bucket-s3"
+  access_key: "zAMiyUijFC3QZOPCPCH3"
+  secret_key: "yLP23klTcPFsK6IXIA0kGkHX8DbP9jETPMZuXeh2"
