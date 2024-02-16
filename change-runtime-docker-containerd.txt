@@ -1,0 +1,24 @@
+======== STEPS TO CHANGE RUNTIME FROM DOCKER TO CONTAINERD=======
+
+1. kubectl cordon worker1.example.local
+2. kubectl drain worker1.example.local --ignore-daemonsets
+3. ssh worker1
+4. systemctl stop kubelet
+5. systemctl stop docker ; systemctl disable docker
+6. yum remove -y docker-ce docker-ce-cli
+
+7. vim /etc/containerd/config.toml (comment below line)
+#disabled_plugins = ["cri"]
+
+8. systemctl restart containerd
+
+9. vim /var/lib/kubelet/kubeadm-flags.env (Add --container-runtime-endpoint=unix:///run/containerd/containerd.sock) like below
+KUBELET_KUBEADM_ARGS="--network-plugin=cni --pod-infra-container-image=k8s.gcr.io/pause:3.6 --container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+
+10. systemctl restart kubelet
+11. kubectl uncordon worker1.example.local
+12. kubectl get nodes -o wide (Check nodes if runtime is change from docker to containerd)
+
+
+
+
