@@ -1,0 +1,1459 @@
+1. Minikube installtion docs.
+https://minikube.sigs.k8s.io/docs/
+
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+minikube start --kubernetes-version=1.26.3  --force
+alias kubectl="minikube kubectl --" (add entry in bashrc)
+kubectl get nodes -o wide
+
+
+
+==================
+1. Create NameSpace
+kubectl apply -f monitoring-ns.yaml 
+
+2. Create Custom Resource Defination
+kubectl create -f prometheus-operator-crds
+
+3. Deploy Pormetheus-operator
+kubectl apply -R -f prometheus-operator
+
+4. Make sure the Opeartor Pods is running
+kubectl get pods -n monitoring
+
+To get the logs first the Labels using below command 
+kubectl get pods -n monitoring --show-labels
+
+To get the pods logs using a label use below command and make sure no error will occurs.
+kubectl logs -l app.kubernetes.io/name=prometheus-operator -n monitoring
+
+5. Deploy Prometheus Folder.
+kubectl apply -f prometheus
+
+[root@monitoring mycode]# kubectl get pods -n monitoring
+NAME                                   READY   STATUS    RESTARTS   AGE
+prometheus-operator-79b454b48b-zkjck   1/1     Running   0          8m7s
+prometheus-staging-0                   2/2     Running   0          48s
+
+If you will notice Prometheus can sits into a 2 containers, First one is prometheus-server itself and second-one is 
+CONFIG RELOADER which convert service-endpoint-monitors to native service configuration
+
+6. Check the Prometheus pods logs make sure there is no error.
+kubectl logs -l app.kubernetes.io/name=prometheus -n monitoring
+
+7. It will deploy 1 service - use port forwarding method to use in a browser.
+
+[root@monitoring mycode]# kubectl get svc -n monitoring
+NAME                  TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)    AGE
+prometheus-operated   ClusterIP   None         <none>        9090/TCP   6m48s
+
+kubectl port-forward svc/prometheus-operated 9090 -n monitoring
+
+In Broswer use -> localhost:9090
+
+=====================================
+DEPLOY MINIO
+
+8. Create Minio Namespace
+kubectl apply -f minio-ns.yaml
+
+9. Deploy minio Folder - (Change console-service to Nodeport and access via browser in 30000 port)
+kubectl apply -f minio
+
+10. Create a bucket named prometheus-metrics and create Secret/Access Key.
+11. Create a Secret to use same in Thanos in a prometheus folder. (Add new file 5-objectstore.yaml as secret in prometheus folder)
+5-objectstore.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: monitoring
+  name: objstore
+stringData:
+  objstore.yml: |-
+    type: S3
+    config:
+      bucket: prometheus-metrics
+      endpoint: "minio.minio:9000"
+      insecure: true
+      access_key: "GPO85GLkBWeU9Uac"
+      secret_key: "fzSjIeayjllfVfzJKbUZEH90L81iMJof"
+
+12. In Prometheus Folder under 3-prometheus.yaml add a Thanos section (It is sidecar conatiner) with the secret name above created.
+  # START: Deployed Thanos Sidecar
+  thanos:
+    version: v0.31.0
+    objectStorageConfig:
+      name: objstore
+      key: objstore.yml
+
+13. deploy again Prometheus folder and now you can see there is 3 container running into a prometheus-staging-0 pods
+[root@monitoring mycode]# kubectl get pods -n monitoring
+NAME                                   READY   STATUS    RESTARTS   AGE
+prometheus-operator-79b454b48b-zkjck   1/1     Running   0          67m
+prometheus-staging-0                   3/3     Running   0          37s
+
+14. Check the Logs for the SideCar container. 
+(You will see 1 error but that normal as will create a required file after 2 hour, sidecar will start uploading data in 2-3 hour)
+kubectl logs -f prometheus-staging-0 -c thanos-sidecar -f -n monitoring
+
+error:-
+msg="reading meta file failed, will override it" err="failed to read /prometheus/thanos.shipper.json: open /prometheus/thanos.shipper.json: no such file or directory"
+
+15. Now create a service for a sidecar. 
+(It it optional if you deploy THANOS into the same cluster, It is required for multi-cluster setup, here the service is cluster IP for multi cloud use service type as loadbalncer)
+(Will secure it later with mutual TLS, Optionally you can whitelist the IP address that Thanos will use to access the sidecar, This way you can create a secure setup even it has to eb axposed to the internet)
+
+Add 6-sidecar-svc into a Prometheus folder to create a service for sidecar container.
+
+# kubectl apply -f prometheus
+
+Now sidecar service is created
+[root@monitoring mycode]# kubectl get svc -n monitoring
+NAME                  TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)              AGE
+prometheus-operated   ClusterIP   None            <none>        9090/TCP,10901/TCP   71m
+sidecar               ClusterIP   10.102.24.154   <none>        10901/TCP            17s
+
+16. Most Important check the ENDPOINTS of sidecar - If you made a mistake in selector the endpoint object will be empty.
+[root@monitoring mycode]# kubectl get endpoints -n monitoring
+NAME                  ENDPOINTS                            AGE
+prometheus-operated   10.244.0.15:10901,10.244.0.15:9090   72m
+sidecar               10.244.0.15:10901                    85s
+
+========================================================
+CENTARLIZED THANOS DEPLOYMENT-
+
+17. Create a Service account for Thanos.( For now will create a single service account which will use later in the cloud to grant access to S3 bucket )
+(Optionally You can create Seprate service account for Quier, Compactor and StorageGateway)
+0-service-account.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: thanos
+  namespace: monitoring
+
+
+18. Create a deployment object for the main Thanos component called Quier. 
+(When creating a Grafana DataSource you will provide this service instaed to prometheus, its relatively simple deployment object that uses thanos service account)
+(For now will only sepcifies the sidecar as --store, Its very essential to prometheus a fully qulified name specially for the mutal TLS, for now keep svc.cluster.local)
+
+1-querier-deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: querier
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: querier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: querier
+    spec:
+      serviceAccount: thanos
+      securityContext:
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: querier
+          image: docker.io/bitnami/thanos:0.31.0
+          args:
+            - query
+            - --log.level=info
+            - --endpoint.info-timeout=30s
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --query.replica-label=prometheus_replica
+            - --store=sidecar.monitoring.svc.cluster.local:10901
+            # # START: Only after you deploy storegateway
+            # - --store=storegateway.monitoring.svc.cluster.local:10901
+            # # END: Only after you deploy storegateway
+            # # START: Mutual TLS
+            # - --grpc-client-tls-secure
+            # - --grpc-client-tls-cert=/secrets/tls.crt
+            # - --grpc-client-tls-key=/secrets/tls.key
+            # - --grpc-client-tls-ca=/secrets/ca.crt
+            # END: Mutual TLS
+          ports:
+            - name: http
+              containerPort: 10902
+              protocol: TCP
+            - name: grpc
+              containerPort: 10901
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 2Gi
+      #     # START: Mutual TLS
+      #     volumeMounts:
+      #       - name: querier-tls
+      #         mountPath: /secrets
+      # volumes:
+      #   - name: querier-tls
+      #     secret:
+      #       secretName: querier-tls
+      # # END: Mutual TLS
+
+19. Now we have to create a Service to Access the querier
+(you will use this service when setting up a datasource in Grafana)
+
+2-querier-service.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: querier
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 10901
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+  selector:
+    app.kubernetes.io/name: querier
+
+# Now go Ahead and apply Thanos Folder. # kubectl apply -f thanos
+
+check the pods and wait until the Quier pods is ready and also check the logs as well.
+[root@monitoring mycode]# kubectl get pods -n monitoring -w
+NAME                                   READY   STATUS    RESTARTS   AGE
+prometheus-operator-79b454b48b-zkjck   1/1     Running   0          100m
+prometheus-staging-0                   3/3     Running   0          33m
+querier-fbcdb9cdf-2v2rb                1/1     Running   0          60s
+
+# kubectl logs -l app.kubernetes.io/name=querier -n monitoring
+
+component=endpointset msg="adding new sidecar with [storeEndpoints rulesAPI exemplarsAPI targetsAPI MetricMetadataAPI]" 
+address=sidecar.monitoring.svc.cluster.local:10901 extLset="{prometheus=\"monitoring/staging\", prometheus_replica=\"prometheus-staging-0\"}
+
+In the above logs you can see a new sidecar as been added to the querier.(If you did a mistake you might see the "Dedline error")
+
+20. Use port-forwards to access querier service in browsers. localhost:9090
+# kubectl port-forward svc/querier 9090 -n monitoring 
+
+(The dashboard looks similiar as prometheus but you will find some additional TABS, For Instance in the "Stores tabs" you will see all connected to local prometheus instance )
+(Currently we have single Staging Prometheus connected), essentially if you set the TTL for 15 days, its sufficient to create a global view for the prometheus instances)
+(You will be able to query using "Thanos_Query Tabs" all Prometheus servers, Correspondingly from a single Grafana DataSource,
+Try to Query "prometheus_http_requests_total" to filter based different environment or clusters), You can also use Prometheus labels as query like
+prometheus_http_requests_total{prometheus="monitoring/staging"} which is basically prometheus object name, for Instance you might have a production prometheus instance that include all production
+metrics like CPU and Memory usage for your application)
+
+If you decide to retain a metric more than 15 days, you will need to use a Storw-Gateway to access them
+
+===========================
+21. Deploy Stote-Gateway
+
+Both querier and store-gateway can scaled horizontally,The Store-Gateway uses a Statefull Sets and local disk to download metrics from S3 and store them as cache,
+If you have a lots of metrics pay attention to memory usage, as OOM killed can occurs frequently. 
+The Store-Gateway can use same Kubernetes Secret {--objstore.config-file=/conf/objstore.yml} with the S3 bucket configuration mounted to conf/objectstore.yml 
+
+3-storegateway-sts.yaml
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  namespace: monitoring
+  name: storegateway
+spec:
+  replicas: 1
+  serviceName: storegateway
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: storegateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storegateway
+    spec:
+      serviceAccount: thanos
+      securityContext:
+        fsGroup: 1001
+      initContainers:
+        - name: init-chmod-data
+          image: docker.io/bitnami/minideb:buster
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /data
+              chown -R "1001:1001" /data
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: storegateway
+          image: docker.io/bitnami/thanos:0.31.0
+          securityContext:
+            runAsUser: 1001
+          args:
+            - store
+            - --chunk-pool-size=2GB
+            - --log.level=debug
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --data-dir=/data
+            - --objstore.config-file=/conf/objstore.yml
+#            # START: Mutual TLS
+#            - --grpc-server-tls-cert=/secrets/tls.crt
+#            - --grpc-server-tls-key=/secrets/tls.key
+#            - --grpc-server-tls-client-ca=/secrets/ca.crt
+#            # END: Mutual TLS
+          ports:
+            - name: http
+              containerPort: 10902
+              protocol: TCP
+            - name: grpc
+              containerPort: 10901
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: objstore
+              mountPath: /conf/objstore.yml
+              subPath: objstore.yml
+            - name: data
+              mountPath: /data
+            # # START: Mutual TLS
+            # - name: storegateway-tls
+            #   mountPath: /secrets
+            # # END: Mutual TLS
+      volumes:
+        - name: objstore
+          secret:
+            secretName: objstore
+        # # START: Mutual TLS
+        # - name: storegateway-tls
+        #   secret:
+        #     secretName: storegateway-tls
+        # # END: Mutual TLS
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 20Gi
+
+22. Create a Service for a Store-Gateway and add it to the querier - (Use fully qualified domain-name since will implement mutual TLS ad well later on)
+4-storegateway-service.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: storegateway
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 10901
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+  selector:
+    app.kubernetes.io/name: storegateway
+
+As Mention earlier, The SideCar can be an external URL, not necessarily located in the same cluster. (On 1-querier-deployment.yaml file)
+            # START: Only after you deploy storegateway
+            - --store=storegateway.monitoring.svc.cluster.local:10901
+
+23. Now we have 4 Files Under Thanos folder, Lets deploy it. (Now kubernetes will redeploy the querier with an additinal store endpoint)
+
+[root@monitoring mycode]# kubectl apply -f thanos
+serviceaccount/thanos unchanged
+deployment.apps/querier configured
+service/querier unchanged
+statefulset.apps/storegateway created
+service/storegateway created
+
+Port-Forward the querier again : - kubectl port-forward svc/querier 9090 -n monitoring
+Now you can find in the dashboard under Store Tab, A new Store Endpoint referencing to the store gateway to access historical data.
+
+---------
+Just a Node Here One Issue is there for me I can see only 1 quier pods but in Video there is 2 pods but I can the additonal endpoints added to Thanos service
+which is "storegateway.monitoring.svc.cluster.local:10901" is UP in Store Section.
+/home/nadeem/Pictures/Screenshots/Screenshot from 2024-03-02 19-22-58.png
+
+
+[root@monitoring mycode]# kubectl get svc -n monitoring
+NAME                  TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)              AGE
+prometheus-operated   ClusterIP   None             <none>        9090/TCP,10901/TCP   140m
+querier               ClusterIP   10.97.118.196    <none>        9090/TCP,10901/TCP   48m
+sidecar               ClusterIP   10.102.24.154    <none>        10901/TCP            68m
+storegateway          ClusterIP   10.108.250.184   <none>        9090/TCP,10901/TCP   5m4s
+-----------
+
+===================
+COMPACTOR DEPLOYMENT
+
+24. If you to Store a metrics for Longer than 15 days, You might want to downsample some of them to reduce their and improve query performance, 
+To do this we have to Deploy a COMPACTOR.
+
+First, Create a Persistent Volume Claim, As the Compactor needs to download RAW data, Downsample it and upload it back to S3.
+We are creating 20GB volume for the same.
+
+5-compactor-pvc.yaml
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  namespace: monitoring
+  name: compactor
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+
+25. Now create a compactor Deployment, It dosen't need a service since we don't need to query it, But it does a user interface.
+Optionally, you can deploy the bucket view compenent, but it is not required.
+
+In this setup, using the CLI flags, we can determibe the metric resolution. for example you can choose to keep raw data for 7 days and then downsample it.
+            - --retention.resolution-raw=7d
+
+Also remember to use the same S3 configuration for the compactor
+      volumes:
+        - name: objstore
+          secret:
+            secretName: objstore
+        - name: data
+          persistentVolumeClaim:
+            claimName: compactor
+
+6-compactor-deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: compactor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compactor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compactor
+    spec:
+      serviceAccount: thanos
+      securityContext:
+        fsGroup: 1001
+      initContainers:
+        - name: init-chmod-data
+          image: docker.io/bitnami/minideb:buster
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /data
+              chown -R "1001:1001" /data
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: compactor
+          image: docker.io/bitnami/thanos:0.31.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1001
+          args:
+            - compact
+            - --log.level=info
+            - --http-address=0.0.0.0:10902
+            - --data-dir=/data
+            - --retention.resolution-raw=7d
+            - --retention.resolution-5m=30d
+            - --retention.resolution-1h=180d
+            - --consistency-delay=30m
+            - --objstore.config-file=/conf/objstore.yml
+            - --wait
+          ports:
+            - name: http
+              containerPort: 10902
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: objstore
+              mountPath: /conf/objstore.yml
+              subPath: objstore.yml
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: objstore
+          secret:
+            secretName: objstore
+        - name: data
+          persistentVolumeClaim:
+            claimName: compactor
+
+
+26. Now Deploy Compactor, as of now I have 7 files 0 to 6 under under Thanos folder.
+
+[root@monitoring mycode]# kubectl apply -f thanos
+serviceaccount/thanos unchanged
+deployment.apps/querier configured
+service/querier unchanged
+statefulset.apps/storegateway configured
+service/storegateway unchanged
+persistentvolumeclaim/compactor created
+deployment.apps/compactor created
+
+[root@monitoring mycode]# kubectl get pods -n monitoring
+NAME                                   READY   STATUS    RESTARTS   AGE
+compactor-6648c9ff9-bnwm9              1/1     Running   0          115s
+prometheus-operator-79b454b48b-zkjck   1/1     Running   0          176m
+prometheus-staging-0                   3/3     Running   0          109m
+querier-5cb565fd56-s7gx8               1/1     Running   0          33m
+storegateway-0                         1/1     Running   0          33m
+
+
+Check Logs:- Note: If something misconfigured, you might see an error stating that it cannot access S3 bucket, but below logs looks clean, That all for remote read.
+
+
+# [root@monitoring mycode]# kubectl logs -l app.kubernetes.io/name=compactor -n monitoring
+Defaulted container "compactor" out of: compactor, init-chmod-data (init)
+level=info ts=2024-03-02T14:14:47.753096958Z caller=retention.go:32 msg="start optional retention"
+level=info ts=2024-03-02T14:14:47.753103854Z caller=retention.go:47 msg="optional retention apply done"
+level=info ts=2024-03-02T14:14:47.753801131Z caller=fetcher.go:478 component=block.BaseFetcher msg="successfully synchronized block metadata" duration=693.764µs duration_ms=0 cached=0 returned=0 partial=0
+level=info ts=2024-03-02T14:14:47.753813679Z caller=clean.go:34 msg="started cleaning of aborted partial uploads"
+level=info ts=2024-03-02T14:14:47.753816622Z caller=clean.go:61 msg="cleaning of aborted partial uploads done"
+level=info ts=2024-03-02T14:14:47.753819197Z caller=blocks_cleaner.go:44 msg="started cleaning of blocks marked for deletion"
+level=info ts=2024-03-02T14:14:47.753825612Z caller=blocks_cleaner.go:58 msg="cleaning of blocks marked for deletion done"
+level=info ts=2024-03-02T14:15:47.751208403Z caller=fetcher.go:478 component=block.BaseFetcher msg="successfully synchronized block metadata" duration=2.15094ms duration_ms=2 cached=0 returned=0 partial=0
+level=info ts=2024-03-02T14:16:47.751220987Z caller=fetcher.go:478 component=block.BaseFetcher msg="successfully synchronized block metadata" duration=2.033723ms duration_ms=2 cached=0 returned=0 partial=0
+level=info ts=2024-03-02T14:17:47.751287612Z caller=fetcher.go:478 component=block.BaseFetcher msg="successfully synchronized block metadata" duration=2.058903ms duration_ms=2 cached=0 returned=0 partial=0
+
+
+
+=======================
+Now if you need to access your local Prometheus over the Internet, for example in the Cloud environment, you can configure mutual TLS.
+To do this, you need to generate a self-signed certificate authority and create certificate for each component.
+
+1. Create a demo-cert folder.
+2. Create a configuration for the certificate authority (CA)
+
+ca-config.json
+{
+    "signing": {
+        "default": {
+            "expiry": "8760h"
+        },
+        "profiles": {
+            "demo": {
+                "usages": [
+                    "signing",
+                    "key encipherment",
+                    "server auth",
+                    "client auth"
+                ],
+                "expiry": "8760h"
+            }
+        }
+    }
+}
+
+3. Create a certificate request for CA. (You can use RSA if you prefer)
+ca-csr.json
+{
+    "CN": "DevOps by Example",           ------>  give a common-name here
+    "key": {
+        "algo": "ecdsa",
+        "size": 256
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "CA",
+            "L": "Los Banos"
+        }
+    ]
+}
+
+4. Now generate the CA. This process the will generate a private key and sign the request, which will become the certificate "ca.pem" which is public and
+can be stored even in a public repository.
+cd to demo-cert directory.
+
+# cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+
+Mutual TLS works by using this CA to verify that the client certificate was issued by this certificate authority.
+Additonaly, you must be have a private key that must be kept secure, as it is used to sign certificate request "ca-key-pem"
+
+Now we need to generate certificates for each components.
+In THANOS if you decide to use mutual TLS with the sidecar, you must use mutal TLS with all other component as well. that is why we need to generate a sertificate
+for all of them. It is important to include the fully qualified doamin-name used by querier as it is must match the certificate, This can also be an external URL 
+with a public domain. By default these certificates will be valid for a year.
+
+      In sidecar-csr.json
+          "hosts": [
+        "sidecar.monitoring.svc.cluster.local",
+        "sidecar.antonputra.com"
+    ],
+
+Create sidecar-csr.json and Let proceed to generate a certificate for a sidecar.
+sidecar-csr.json
+{
+    "CN": "sidecar.monitoring.svc.cluster.local",
+    "hosts": [
+        "sidecar.monitoring.svc.cluster.local",
+        "sidecar.antonputra.com"
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "CA",
+            "L": "Los Banos"
+        }
+    ]
+}
+
+# cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=demo sidecar-csr.json | cfssljson -bare sidecar
+
+[root@monitoring demo-certs]#  cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=demo sidecar-csr.json | cfssljson -bare sidecar
+2024/03/02 20:39:22 [INFO] generate received request
+2024/03/02 20:39:22 [INFO] received CSR
+2024/03/02 20:39:22 [INFO] generating key: rsa-2048
+2024/03/02 20:39:22 [INFO] encoded CSR
+2024/03/02 20:39:22 [INFO] signed certificate with serial number 111379450398328723995426474018520058070294295401
+2024/03/02 20:39:22 [WARNING] This certificate lacks a "hosts" field. This makes it unsuitable for
+websites. For more information see the Baseline Requirements for the Issuance and Management
+of Publicly-Trusted Certificates, v.1.1.6, from the CA/Browser Forum (https://cabforum.org);
+specifically, section 10.2.3 ("Information Requirements").
+
+5. Now, Create a certificate for a querier. (here hosts:"querier" doestn't need a valid DNS on the certificate, however if you stuck queriers on top of each other
+then you'll need to fully qualified name )
+
+
+
+querier-csr.json
+{
+    "CN": "querier",
+    "hosts": [
+        "querier"
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "CA",
+            "L": "Los Banos"
+        }
+    ]
+}
+
+Generate a certificate for a Querier.
+# [root@monitoring demo-certs]# cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=demo querier-csr.json | cfssljson -bare querier
+2024/03/02 23:43:25 [INFO] generate received request
+2024/03/02 23:43:25 [INFO] received CSR
+2024/03/02 23:43:25 [INFO] generating key: rsa-2048
+2024/03/02 23:43:25 [INFO] encoded CSR
+2024/03/02 23:43:25 [INFO] signed certificate with serial number 130902443838833834279276485543782491174666343410
+2024/03/02 23:43:25 [WARNING] This certificate lacks a "hosts" field. This makes it unsuitable for
+websites. For more information see the Baseline Requirements for the Issuance and Management
+of Publicly-Trusted Certificates, v.1.1.6, from the CA/Browser Forum (https://cabforum.org);
+specifically, section 10.2.3 ("Information Requirements").
+
+6. Now, Generate a certificate for a Store-Gateway. This ine also must have fully qualified domain name since it will be accessed by the querier.
+
+storegateway-csr.json
+{
+    "CN": "storegateway.monitoring.svc.cluster.local",
+    "hosts": [
+        "storegateway.monitoring.svc.cluster.local"
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "CA",
+            "L": "Los Banos"
+        }
+    ]
+}
+
+#[root@monitoring demo-certs]# cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=demo storegateway-csr.json | cfssljson -bare storegateway
+2024/03/02 23:47:06 [INFO] generate received request
+2024/03/02 23:47:06 [INFO] received CSR
+2024/03/02 23:47:06 [INFO] generating key: rsa-2048
+2024/03/02 23:47:06 [INFO] encoded CSR
+2024/03/02 23:47:06 [INFO] signed certificate with serial number 516002868269868345865097275246791474811639588807
+2024/03/02 23:47:06 [WARNING] This certificate lacks a "hosts" field. This makes it unsuitable for
+websites. For more information see the Baseline Requirements for the Issuance and Management
+of Publicly-Trusted Certificates, v.1.1.6, from the CA/Browser Forum (https://cabforum.org);
+specifically, section 10.2.3 ("Information Requirements").
+
+Now we have all the required certificates and private keys.
+
+====================================================================
+
+27. First create a sidecar with TLS by creating a secret, here we have 3 keys 1-certificate, 2-privatekey and 3-common CA.
+
+A. copy the sidecar certificate first. (sidecar.pem) under tls.crt
+B. copy the private key for the sidecar (sidecar-key.pem) under tls.key
+C. copy the CA certificate (ca.pem) under ca.crt. (Which will be same for all secrets. It must be same for the mutal TLS )
+
+7-sidecar-tls.yaml 
+---
+# ONLY for Mutual TLS
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sidecar-tls
+  namespace: monitoring
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIDPjCCAuSgAwIBAgIUEpgmpm/+aLgkjhL3w8GagWuXxmUwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE4MDMwMFoXDTI1
+    MDMwMjE4MDMwMFowXTELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxLTArBgNVBAMTJHNpZGVjYXIubW9uaXRvcmluZy5zdmMuY2x1
+    c3Rlci5sb2NhbDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKylLfPq
+    WogHQHAcc684gClZHEyyJTp2j9b+x7mlp5fsQBlQZl3qcLar9gwJxXi9tc4/zTHX
+    nU95TDcZs5G0Haj6APrNu/p87CdFAkwq+pZgmSgl94LwUFFXfhmxZ7qyiEYFN/Gl
+    fr+r4futy2l6RjmMZhcDtq2qLv9JOwHY3uu5axLXy+08lxBUWQD5vQVdFSE1ePxp
+    tG3eiXwN3wVMH1dLBuPUbrO1pqy3hBSF9A0ESdmQULVHk/G13as/vn396KVvPJwZ
+    NqLFEvoyDqUt3wiO5uCIndRyvqEkU7tjzmC35xzT5IrAJ8KshQXbDkfIkc0qq4fe
+    pOlVhDAec+yWBB0CAwEAAaOByTCBxjAOBgNVHQ8BAf8EBAMCBaAwHQYDVR0lBBYw
+    FAYIKwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFG9f
+    9JQCptYawVzWp98S4Fw6GNT0MB8GA1UdIwQYMBaAFK++eYC504/Q2bH+3bIlprb8
+    u/1aMEcGA1UdEQRAMD6CJHNpZGVjYXIubW9uaXRvcmluZy5zdmMuY2x1c3Rlci5s
+    b2NhbIIWc2lkZWNhci5hbnRvbnB1dHJhLmNvbTAKBggqhkjOPQQDAgNIADBFAiEA
+    /ujvT/jhmkusiijifyT0DKUqxlvJETP+GUsko7SPznYCIApuV5QtwYl4zFjQqKf9
+    1lLOSA6opwiEyXSiB6t0LKiJ
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN RSA PRIVATE KEY-----
+    MIIEoQIBAAKCAQEArKUt8+paiAdAcBxzrziAKVkcTLIlOnaP1v7HuaWnl+xAGVBm
+    Xepwtqv2DAnFeL21zj/NMdedT3lMNxmzkbQdqPoA+s27+nzsJ0UCTCr6lmCZKCX3
+    gvBQUVd+GbFnurKIRgU38aV+v6vh+63LaXpGOYxmFwO2raou/0k7Adje67lrEtfL
+    7TyXEFRZAPm9BV0VITV4/Gm0bd6JfA3fBUwfV0sG49Rus7WmrLeEFIX0DQRJ2ZBQ
+    tUeT8bXdqz++ff3opW88nBk2osUS+jIOpS3fCI7m4Iid1HK+oSRTu2POYLfnHNPk
+    isAnwqyFBdsOR8iRzSqrh96k6VWEMB5z7JYEHQIDAQABAoIBACe3tHOp1Xv31x4z
+    nXWRFQLuKjGGxkPF5N98K6yM7Jpp0nFAatxuQ9Hyi59HXDOjyUCSsv0lcl5HNH50
+    njgF7NDj+ve3/ufod1eta5LkTFPuEy4GVgO8j223KB53DrsHuYwKRU2FWjx0KYAC
+    AorYg3FX2GCxDQS04yz9xuJs5xPpanpvFEgycu0lGnvbHlOrR1QQHDgpaXPOP4A4
+    SsTPy/tZ8FolWrPp/BOzxqqXm8pIZtKndWKo3iA3IYvyhNcgipxRIK1Pm63EBqoq
+    vrB999RH76icpw+rfwU3ezR2fAmyCfx6vvkNU3uAKRRu6vU8Gayu2bADCFxotLca
+    LqTkR60CgYEA0zFajEBZeEfj/tg0cBQ4K/lu6j0aYhUtqOx3AMzVsPOUE8ALAulc
+    SYslDtp1RaNhWOhoYwMP65AtEctx8W1K+wMFTmVYVkayAmY4Y5ZfagFeR4E9iBOJ
+    cmz4zEv9cXGTm1r+UHwSdCdnvrQDIRCsR/WyNMW0DzJCNOJ6DmYA4X8CgYEA0UYr
+    Ep+/5xSBrXYefaSOa+RKp0LW4CfUOStCzX51ov1QBmj7t4gMponylvEd1Xv88p89
+    95w1Klc5M1Q7NB6u/lPjVYbXRcWba3unVkZv6Oiy35RU/VTg1IUnXKXTDqwsXdk4
+    OLpexZLjB+JsiqWLUafrReTPLYV6JwxS4d2JMGMCgYBKAta/peF05ITDD5O4320c
+    BArZrdYsH03kEBJYRnBw1bvD/B4fxBYic8/l16sXX31DAhdq82zF2b3hqZFh0TJg
+    qxtV8PA3NAk4DAig5dbEOHyIxIMCyA33+rZqKgtEkU/wNsA/BmwVJqYVz9H06Xnm
+    sfTkx5AlbzCChgfOOfL/EwJ/JMkwyRVLplL0eIlK0ssaPdzjQoN9Qem+ZE42b+jK
+    xNvCNV4+4QQJNT0KZ336wIwK6psTSXMr5UVvyJYF0iOSnyIf0+jf7mPN7hbOU1wO
+    T+KXjrWEOwOwgarmQGLltq6NHfIQ7+fSwOgRAFHMwpJW6wOZV6/gux+7WSHRb+KB
+    OwKBgQDGODbMwQT52jr/Emq9ZgEE4a8mlYfkDOwaiFmT9snKi5iYpqC/irc77Ylx
+    7ugWaRE2lR8Icyg1zKEy9aqhAjKzbj5MLVPkBKHbEqD6IAXGu9/TJYv6+EArJ6u4
+    j8uJIWKA7qha7KcTMauUmSOv+vMJqwBPQsP+Lu55ZbV4cmLKuw==
+    -----END RSA PRIVATE KEY-----
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIB/DCCAaKgAwIBAgIUXbbD/JjqzKRikjZf1Gd8LNI6X4MwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE0NDYwMFoXDTI5
+    MDMwMTE0NDYwMFowSjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxGjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMFkwEwYHKoZI
+    zj0CAQYIKoZIzj0DAQcDQgAEAg/lC8koD3lyHZPOV8BtNMkV6ug/llp92bWQNZD1
+    Ii9LOnu/3TYP2mSfZlupZLsAU0BZwC7n9JbFAtBkq6ikGKNmMGQwDgYDVR0PAQH/
+    BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQIwHQYDVR0OBBYEFK++eYC504/Q2bH+
+    3bIlprb8u/1aMB8GA1UdIwQYMBaAFK++eYC504/Q2bH+3bIlprb8u/1aMAoGCCqG
+    SM49BAMCA0gAMEUCIHSuYQ9GiGTQ1G79vU1gbFAZltfzbJCDRKRyCcdoC5yZAiEA
+    iP5N8Ue6YORrKhSyDh/fKQFCkJDQ/igk/u+8YzO/vwM=
+    -----END CERTIFICATE-----
+
+
+28. Next we need to provide this secret to the querier. To do this, we add additional GRPCTLS section in 3-prometheus.yaml under prometheus folder.
+We also need to mount that secret as a volume inside the querier container. So the querier will enforce mutal TLS and reject all other requests, including 
+HTTP and HTTPS from random clients on the internet.
+
+3-prometheus.yaml
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: staging
+  namespace: monitoring
+spec:
+  version: v2.43.1
+  serviceAccountName: prometheus
+  podMonitorSelector:
+    matchLabels:
+      prometheus: main
+  podMonitorNamespaceSelector:
+    matchLabels:
+      monitoring: prometheus
+  serviceMonitorSelector:
+    matchLabels:
+      prometheus: main
+  serviceMonitorNamespaceSelector:
+    matchLabels:
+      monitoring: prometheus
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 2Gi
+  replicas: 1
+  logLevel: info
+  logFormat: logfmt
+  retention: 6h
+  scrapeInterval: 15s
+  securityContext:
+    fsGroup: 0
+    runAsNonRoot: false
+    runAsUser: 0
+  storage:
+    volumeClaimTemplate:
+      spec:
+        resources:
+          requests:
+            storage: 20Gi
+  # START: Deployed Thanos Sidecar
+  thanos:
+    version: v0.31.0
+    objectStorageConfig:
+      name: objstore
+      key: objstore.yml
+    END: Deployed Thanos Sidecar
+    # START: Mutual TLS
+    grpcServerTlsConfig:
+      caFile: /secrets/ca.crt
+      certFile: /secrets/tls.crt
+      keyFile: /secrets/tls.key
+  containers:
+    - name: thanos-sidecar
+      volumeMounts:
+        - name: sidecar-tls
+          mountPath: /secrets
+  volumes:
+    - name: sidecar-tls
+      secret:
+        secretName: sidecar-tls
+  # END: Mutual TLS
+
+
+29. Finally we need to implement mutal TLS on the Thanos Side.
+First create a secret to store the querier TLS certificate and private key.
+
+A. copy the querier certificate first. (querier.pem) under tls.crt
+B. copy the private key for the querier (querier-key.pem) under tls.key
+C. copy the CA certificate (ca.pem) under ca.crt. (Which will be same for all secrets. It must be same for the mutal TLS )
+
+7-querier-tls.yaml (under thanos directory)
+---
+# ONLY: Mutual TLS
+apiVersion: v1
+kind: Secret
+metadata:
+  name: querier-tls
+  namespace: monitoring
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIC7TCCApKgAwIBAgIUFu3eXBp72eGYxe+TthSvo5gZk/IwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE4MDgwMFoXDTI1
+    MDMwMjE4MDgwMFowQDELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxEDAOBgNVBAMTB3F1ZXJpZXIwggEiMA0GCSqGSIb3DQEBAQUA
+    A4IBDwAwggEKAoIBAQDOQ0S1HU/YURf8M/49H97kH32ufKo0EJeXdjjvX68UOhND
+    cWY3bZn5MHBucbS4GGw5Oh52d9t3L1rhIGe8wWA17fQEEEqEFZ/VEbeaiLl/PvJv
+    a+nfEktiDYjvpTfRdS0bTc6dQ4aYPBUFcKyHR+P8WChiDybvf5dB6Knd3JaL5QVn
+    K+OZtLJo9W8efGwJkmXt5mxFclAa51L32kfE/kL9/u55Nl4xlpA97Jdsiutna87F
+    6cVnJsjj/lZ0BXck1usALbiRLop28m2vjaxPXDK8tF8lqvgfq0Ouy7v2VFIB0k2N
+    nPnQMkkwMRRuWSxIQt3xEU7evyJChvXSPa0OOHLPAgMBAAGjgZQwgZEwDgYDVR0P
+    AQH/BAQDAgWgMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggrBgEFBQcDAjAMBgNVHRMB
+    Af8EAjAAMB0GA1UdDgQWBBTl/3XZSYxt+wBsMvma0xs7GHJICjAfBgNVHSMEGDAW
+    gBSvvnmAudOP0Nmx/t2yJaa2/Lv9WjASBgNVHREECzAJggdxdWVyaWVyMAoGCCqG
+    SM49BAMCA0kAMEYCIQDvSDO77qykfjd4w3lwJzAaONH9udQ/bjN6VZUhf7vNiwIh
+    AIcG0T4hTJOdNhvpqKqnu3JsvsLWixQE506DTPpGCK5A
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN RSA PRIVATE KEY-----
+    MIIEpQIBAAKCAQEAzkNEtR1P2FEX/DP+PR/e5B99rnyqNBCXl3Y471+vFDoTQ3Fm
+    N22Z+TBwbnG0uBhsOToednfbdy9a4SBnvMFgNe30BBBKhBWf1RG3moi5fz7yb2vp
+    3xJLYg2I76U30XUtG03OnUOGmDwVBXCsh0fj/FgoYg8m73+XQeip3dyWi+UFZyvj
+    mbSyaPVvHnxsCZJl7eZsRXJQGudS99pHxP5C/f7ueTZeMZaQPeyXbIrrZ2vOxenF
+    ZybI4/5WdAV3JNbrAC24kS6KdvJtr42sT1wyvLRfJar4H6tDrsu79lRSAdJNjZz5
+    0DJJMDEUblksSELd8RFO3r8iQob10j2tDjhyzwIDAQABAoIBAQC/X35yJH4ekC8W
+    2w66m8VsFyO/Lv+kSvi7mP7+aeLBe5i/7IkQSGqh36WRc4JfhJl1B02YUWCY1qEV
+    W8GkSi8AGoVa99qLbpzbThLyGIUzYK4DXzaguBKlKTWyU7LUbkmpmaloFGze9m/y
+    mjYZVkRbr1fYk4JmmBU5G6vvo2ky5WKJ09yZdCOdvqZISg0ygLCzqNJ7yvnN7pVC
+    /CS2firOE/+NLrozUQvYzGoedxFxFfae3W0s202PsuAvFXRB6YO8N7er1aPskmvl
+    MkjpEWuo9Cy5nK+Lz7heZHxGV6c9+e83DC04lrrjjxDCW8PPEcxgbdmnJXUC+h2X
+    uVlM1/zBAoGBAOLPqcWrykrtHP8jeZ6KUHSZ2Vu5XL+nJ155sIQqRoldzaWbmGWu
+    BjFVbAIE60sdE0Afruky04mZOleC80ZIHOlZPbqrrE07XfGH8oZwwNEh+N7/ETAZ
+    7Xe21ukXQGyEHDoHTPtcSs5F06vD/xwdulzetUv9Ggu4EM+ZqIBQ3DDxAoGBAOjO
+    oj8mZ19mnfEo247oQhskRK36PWbrd4cXOFLsGpTahkEwnTC11fnOqNY6df0QUx52
+    lo5kVdSah02rwd+GicS7oNVwcf9io9VEfJUCwxI1ZVADZfMzANACgv8Qzs9uf9Yr
+    uMygiBbzC9uP0UakNyrMEyrmBvJ70GLsTvIgLt+/AoGBAMDpnB7zNQZxkx43UDRW
+    tIPYb5WinY6tX8DthAOF6aTg0g8vvnmNgNrpKwq0oGStADikOiNDBcWdPJA+Yyi+
+    IUkgjG5/ofe2rPrIhLFwqa+3U3RoQnhFNUODkluDWVpzK4b3urR5FW9I2PbZp9yE
+    NITVMCLHziV1k2bf7P/mxsIhAoGARTv+YE1pfKOl4OxHr04/Kpc0nZDH5e2s1E4B
+    gBebKB18w7JTbQMGqY3eBCfKowHR1kNqLtqD9AAosN6df34hRpKOGCuim1KYano9
+    mosBvE6I3KzGCvdmDHZSwswa1PGFrwm9oY00K68IHbm9gQahKWcbZCyYcFCF/oVM
+    TRFpHz0CgYEAgpke8avaRoYX6gM5bk+pSfDlbZYEUvPGu6SfKfmWM58WJz3x8GNt
+    xg30ibyztrqPIEVfrjiqJ7yH013xBQ0d4rFWVW/PfkXqbrVnOpOJ6k7kfOh8Zf44
+    e/UoCxSYv2syE7mWDeICY+6OPypRNInJOi2iiOsCbKX9FMh6qhb05BU=
+    -----END RSA PRIVATE KEY-----
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIB/DCCAaKgAwIBAgIUXbbD/JjqzKRikjZf1Gd8LNI6X4MwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE0NDYwMFoXDTI5
+    MDMwMTE0NDYwMFowSjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxGjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMFkwEwYHKoZI
+    zj0CAQYIKoZIzj0DAQcDQgAEAg/lC8koD3lyHZPOV8BtNMkV6ug/llp92bWQNZD1
+    Ii9LOnu/3TYP2mSfZlupZLsAU0BZwC7n9JbFAtBkq6ikGKNmMGQwDgYDVR0PAQH/
+    BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQIwHQYDVR0OBBYEFK++eYC504/Q2bH+
+    3bIlprb8u/1aMB8GA1UdIwQYMBaAFK++eYC504/Q2bH+3bIlprb8u/1aMAoGCCqG
+    SM49BAMCA0gAMEUCIHSuYQ9GiGTQ1G79vU1gbFAZltfzbJCDRKRyCcdoC5yZAiEA
+    iP5N8Ue6YORrKhSyDh/fKQFCkJDQ/igk/u+8YzO/vwM=
+    -----END CERTIFICATE-----
+
+30. To enable mutal TLS on the querier, we need to include the TLS certificate and mount it as a volume inside the pods.
+          # START: Mutual TLS
+          volumeMounts:
+            - name: querier-tls
+              mountPath: /secrets
+      volumes:
+        - name: querier-tls
+          secret:
+            secretName: querier-tls
+      # END: Mutual TLS                  
+
+Additionaly we need to use the client TLS "secure option" and provide both the client and server certificates to enable mutual TLS.
+            # END: Only after you deploy storegateway
+            # START: Mutual TLS
+            - --grpc-client-tls-secure
+            - --grpc-client-tls-cert=/secrets/tls.crt
+            - --grpc-client-tls-key=/secrets/tls.key
+            - --grpc-client-tls-ca=/secrets/ca.crt
+            # END: Mutual TLS
+
+
+1-querier-deployment.yaml (under Thanos directory)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: querier
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: querier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: querier
+    spec:
+      serviceAccount: thanos
+      securityContext:
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: querier
+          image: docker.io/bitnami/thanos:0.31.0
+          args:
+            - query
+            - --log.level=info
+            - --endpoint.info-timeout=30s
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --query.replica-label=prometheus_replica
+            - --store=sidecar.monitoring.svc.cluster.local:10901
+            # START: Only after you deploy storegateway
+            - --store=storegateway.monitoring.svc.cluster.local:10901
+            # END: Only after you deploy storegateway
+            # START: Mutual TLS
+            - --grpc-client-tls-secure
+            - --grpc-client-tls-cert=/secrets/tls.crt
+            - --grpc-client-tls-key=/secrets/tls.key
+            - --grpc-client-tls-ca=/secrets/ca.crt
+            # END: Mutual TLS
+          ports:
+            - name: http
+              containerPort: 10902
+              protocol: TCP
+            - name: grpc
+              containerPort: 10901
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 2Gi
+          # START: Mutual TLS
+          volumeMounts:
+            - name: querier-tls
+              mountPath: /secrets
+      volumes:
+        - name: querier-tls
+          secret:
+            secretName: querier-tls
+      # END: Mutual TLS
+
+
+31. FInally to create a kubernetes TLS secret for the store-gateway.
+
+A. copy the storegateway.pem certificate first. (storegateway.pem ) under tls.crt
+B. copy the private key for the storegateway.pem  (storegateway-key.pem) under tls.key
+C. copy the CA certificate (ca.pem) under ca.crt. (Which will be same for all secrets. It must be same for the mutal TLS )
+
+8-storegateway-tls.yaml (under Thanos directory)
+
+---
+# ONLY: Mutual TLS
+apiVersion: v1
+kind: Secret
+metadata:
+  name: storegateway-tls
+  namespace: monitoring
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIDLzCCAtagAwIBAgIUWmJebaX4LFEF7enpqCkWlP1qZ8cwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE4MTIwMFoXDTI1
+    MDMwMjE4MTIwMFowYjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxMjAwBgNVBAMTKXN0b3JlZ2F0ZXdheS5tb25pdG9yaW5nLnN2
+    Yy5jbHVzdGVyLmxvY2FsMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA
+    0fyqlWPc+gFA8VuWT3n7wXIgu9Ey9gaegK3BlERih2y0W5/tWjgFlVVjTxzs9mtC
+    JgTBbe41W6KLhSkZXi9EE+r8iu7583zFauPS7dmk2A2ii89ab9/WTpgg7nqv7gRp
+    ILah7fsj1zo/6lEj3uVrMdeCqFxdruCvT5IOXzCwzfBK/hRlGXr9zVxUBWtNTEtL
+    u80vSzo+bn9IIoQIa0Qf4O2RSIazFMYDRZd/8gQqzDT2b1PpEGnixxlmWpTjdipk
+    JNIqT4MQzQnoy5OZ/JlwT2JOZ1oG4WXTX3m80gItGiZlTuhlLb9uUvE6qR+yV/yG
+    TbZjbPw5lp+aPGsf37wSlQIDAQABo4G2MIGzMA4GA1UdDwEB/wQEAwIFoDAdBgNV
+    HSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwDAYDVR0TAQH/BAIwADAdBgNVHQ4E
+    FgQUhVrSoouqvTRhq9LON3lsP4flnGcwHwYDVR0jBBgwFoAUr755gLnTj9DZsf7d
+    siWmtvy7/VowNAYDVR0RBC0wK4Ipc3RvcmVnYXRld2F5Lm1vbml0b3Jpbmcuc3Zj
+    LmNsdXN0ZXIubG9jYWwwCgYIKoZIzj0EAwIDRwAwRAIgNOwFASKrTqfFBC6RiSg3
+    Y06NDegSQIwKFlBn0TWDaBsCIAqiPXO3j/UCN7nP+c2fecus5tTZlDOrJkKMahGO
+    0Y7q
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN RSA PRIVATE KEY-----
+    MIIEpAIBAAKCAQEA0fyqlWPc+gFA8VuWT3n7wXIgu9Ey9gaegK3BlERih2y0W5/t
+    WjgFlVVjTxzs9mtCJgTBbe41W6KLhSkZXi9EE+r8iu7583zFauPS7dmk2A2ii89a
+    b9/WTpgg7nqv7gRpILah7fsj1zo/6lEj3uVrMdeCqFxdruCvT5IOXzCwzfBK/hRl
+    GXr9zVxUBWtNTEtLu80vSzo+bn9IIoQIa0Qf4O2RSIazFMYDRZd/8gQqzDT2b1Pp
+    EGnixxlmWpTjdipkJNIqT4MQzQnoy5OZ/JlwT2JOZ1oG4WXTX3m80gItGiZlTuhl
+    Lb9uUvE6qR+yV/yGTbZjbPw5lp+aPGsf37wSlQIDAQABAoIBADXCI8G/ITF35LJl
+    qiOKrSMnHq42rn9Bzo5O7YIRx8+3yqyyUseIFBXZGGWGmDu11ed5zDNiipJ9GI7s
+    qKvuGdWnkSPYbnEhfkERNkziLUuKohR870A449qXI8cp7aRXyLoxR19vrgtJxFcu
+    kqpbvYezDqYfj3RX3UnXsIo6Iul1pg3QuFcq5xIH2KJEzNiKMZBpwkMJHjqxwRmF
+    ELS4vf537JI+KkgtruCMpvmhVUSbNhlQArAe9ig6Fww0+UyowhWj4hA21hifLVrU
+    93O4lixP+qlczOOQb4kSX/dWD/Sy6wOmw/yHBmvuV0drtoTQwRDOwEb7owFUkmkA
+    N7mrLYECgYEA+jlFd8l2Ef6fPMV+IPCgCg09tucxPYasukO+Ygx39JnprwaaVMp5
+    jZ3Zoc7QAI1n3sADE6Bydbf3uuLPht74fmEq0AweASmxLiJZEma10MRs1uVtqkU/
+    a7JbedaGHxavAmlb5f5vu5GQOWFxDfyllX9oyJdZPIcKh6bXHQ1A03ECgYEA1tWc
+    Y876W+EQmneoV6PatSVPIcYX0KmR3PLZY/CctJy0rbTGXiHlVFP7ZUI75wTnmaz2
+    30L15V28w5IyliZQld3tujRd+gKo3Ws3BBS2tH5iRca3BAQZLLn/VTxFGx+2AoSa
+    ND94LcBcOdxPrTqbXBOrTanJSVYkYWIt7GUBl2UCgYEA3LXNp6ZFBgRQ0trksQtu
+    Ls+VIxL0JO/4xWdhs7yJxnBIZoDtemMKKrcUMxxn7kTMXPeC/znkHB/EXM0Y/j8I
+    cvkkOVSm1qG+zhGv/YIpV1cbJcZDIBBqq4UsGOD3ds6cWgUy8UCnr4vq6iIgBZVX
+    PPGgLGcLaE85I4QvdEmvZ5ECgYAQ2WgOm+ke06QNuVzGot9AXdC7AWJUxzfdcF6E
+    bBaeQ7wX85mrQFVQK9YHtw4jrErNzrb+A65tctCfNhQpmo+vcVx3wiustBCybPo/
+    o7BAr7jdaBxqgDfJPj08XiG9YttPjz7Y4jF2xSN2lkTZfUM6EYDZ8nsK+WqZCK45
+    YCKj0QKBgQDlS5q0UgsosduWmr92V+iDMRQibVK1XFlX4g8IBkvZNNWYWmrFCYMJ
+    P5/T9ntibSndtDFwxVzaQViFvrTH7Fg8SJyrEqkryWMjpr9O0+uyPKMCP1X6bUcC
+    duK134jrhytla7RGhk65OJQyz0P1qSdawTx2Cb7qLmX1OVIxzUxc/w==
+    -----END RSA PRIVATE KEY-----
+
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIB/DCCAaKgAwIBAgIUXbbD/JjqzKRikjZf1Gd8LNI6X4MwCgYIKoZIzj0EAwIw
+    SjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQHEwlMb3MgQmFub3Mx
+    GjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMB4XDTI0MDMwMjE0NDYwMFoXDTI5
+    MDMwMTE0NDYwMFowSjELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRIwEAYDVQQH
+    EwlMb3MgQmFub3MxGjAYBgNVBAMTEURldk9wcyBieSBFeGFtcGxlMFkwEwYHKoZI
+    zj0CAQYIKoZIzj0DAQcDQgAEAg/lC8koD3lyHZPOV8BtNMkV6ug/llp92bWQNZD1
+    Ii9LOnu/3TYP2mSfZlupZLsAU0BZwC7n9JbFAtBkq6ikGKNmMGQwDgYDVR0PAQH/
+    BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQIwHQYDVR0OBBYEFK++eYC504/Q2bH+
+    3bIlprb8u/1aMB8GA1UdIwQYMBaAFK++eYC504/Q2bH+3bIlprb8u/1aMAoGCCqG
+    SM49BAMCA0gAMEUCIHSuYQ9GiGTQ1G79vU1gbFAZltfzbJCDRKRyCcdoC5yZAiEA
+    iP5N8Ue6YORrKhSyDh/fKQFCkJDQ/igk/u+8YzO/vwM=
+    -----END CERTIFICATE-----
+
+32. For store-gateway we need to create a volume using the TLS secret we created on step 31 and mount it into the secret directory in the statefull set.
+            # START: Mutual TLS
+            - name: storegateway-tls
+              mountPath: /secrets
+            # END: Mutual TLS
+        
+        
+        # START: Mutual TLS
+        - name: storegateway-tls
+          secret:
+            secretName: storegateway-tls
+        # END: Mutual TLS
+
+
+The sertificate and private key must be used as the server certificate and not client in the querier. 
+This will enable mutual TLS between the store gateway and querier.
+
+            # START: Mutual TLS
+            - --grpc-server-tls-cert=/secrets/tls.crt
+            - --grpc-server-tls-key=/secrets/tls.key
+            - --grpc-server-tls-client-ca=/secrets/ca.crt
+            # END: Mutual TLS
+
+3-storegateway-sts.yaml (under Thanos directory)        
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  namespace: monitoring
+  name: storegateway
+spec:
+  replicas: 1
+  serviceName: storegateway
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: storegateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storegateway
+    spec:
+      serviceAccount: thanos
+      securityContext:
+        fsGroup: 1001
+      initContainers:
+        - name: init-chmod-data
+          image: docker.io/bitnami/minideb:buster
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /data
+              chown -R "1001:1001" /data
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: storegateway
+          image: docker.io/bitnami/thanos:0.31.0
+          securityContext:
+            runAsUser: 1001
+          args:
+            - store
+            - --chunk-pool-size=2GB
+            - --log.level=debug
+            - --grpc-address=0.0.0.0:10901
+            - --http-address=0.0.0.0:10902
+            - --data-dir=/data
+            - --objstore.config-file=/conf/objstore.yml
+            # START: Mutual TLS
+            - --grpc-server-tls-cert=/secrets/tls.crt
+            - --grpc-server-tls-key=/secrets/tls.key
+            - --grpc-server-tls-client-ca=/secrets/ca.crt
+            # END: Mutual TLS
+          ports:
+            - name: http
+              containerPort: 10902
+              protocol: TCP
+            - name: grpc
+              containerPort: 10901
+              protocol: TCP
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          readinessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: objstore
+              mountPath: /conf/objstore.yml
+              subPath: objstore.yml
+            - name: data
+              mountPath: /data
+            # START: Mutual TLS
+            - name: storegateway-tls
+              mountPath: /secrets
+            # END: Mutual TLS
+      volumes:
+        - name: objstore
+          secret:
+            secretName: objstore
+        # START: Mutual TLS
+        - name: storegateway-tls
+          secret:
+            secretName: storegateway-tls
+        # END: Mutual TLS
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 20Gi
+
+
+33. Lets start applying the prometheus SideCar.
+kubectl apply -f prometheus
+
+Now the secret is created.
+[root@monitoring mycode]# kubectl get secret -n monitoring
+NAME                              TYPE                DATA   AGE
+objstore                          Opaque              1      6h52m
+prometheus-staging                Opaque              1      7h51m
+prometheus-staging-tls-assets-0   Opaque              0      7h51m
+prometheus-staging-web-config     Opaque              1      7h51m
+sidecar-tls                       kubernetes.io/tls   3      16m
+
+ Wait until all pods will come up.
+ [root@monitoring mycode]# kubectl get pods -n monitoring
+NAME                                   READY   STATUS    RESTARTS   AGE
+compactor-6648c9ff9-bnwm9              1/1     Running   0          5h5m
+prometheus-operator-79b454b48b-zkjck   1/1     Running   0          7h59m
+prometheus-staging-0                   3/3     Running   0          5m43s
+querier-5cb565fd56-s7gx8               1/1     Running   0          5h37m
+storegateway-0                         1/1     Running   0          5h37m
+
+34. Next apply all Thanos Secret.
+
+[root@monitoring mycode]# kubectl apply -f thanos
+serviceaccount/thanos unchanged
+deployment.apps/querier configured
+service/querier unchanged
+statefulset.apps/storegateway configured
+service/storegateway unchanged
+persistentvolumeclaim/compactor unchanged
+deployment.apps/compactor unchanged
+secret/querier-tls created
+secret/storegateway-tls created
+
+Wait until all pods are running and secret get created.
+[root@monitoring mycode]# kubectl get secret,pods -n monitoring
+NAME                                     TYPE                DATA   AGE
+secret/objstore                          Opaque              1      6h55m
+secret/prometheus-staging                Opaque              1      7h54m
+secret/prometheus-staging-tls-assets-0   Opaque              0      7h54m
+secret/prometheus-staging-web-config     Opaque              1      7h54m
+secret/querier-tls                       kubernetes.io/tls   3      54s
+secret/sidecar-tls                       kubernetes.io/tls   3      18m
+secret/storegateway-tls                  kubernetes.io/tls   3      54s
+
+NAME                                       READY   STATUS    RESTARTS   AGE
+pod/compactor-6648c9ff9-bnwm9              1/1     Running   0          5h7m
+pod/prometheus-operator-79b454b48b-zkjck   1/1     Running   0          8h
+pod/prometheus-staging-0                   3/3     Running   0          7m25s
+pod/querier-56769c74bb-g5cdn               1/1     Running   0          55s
+pod/storegateway-0                         1/1     Running   0          54s
+
+35. Check the Querier logs. you will find that it added a new stores. if you made a mistake with mutal TLS and domainnames, you will get a deadline exceeded.
+
+
+root@monitoring mycode]# kubectl logs -l app.kubernetes.io/name=querier -n monitoring
+level=info ts=2024-03-02T19:20:57.632430252Z caller=query.go:840 msg="starting query node"
+level=info ts=2024-03-02T19:20:57.632673672Z caller=intrumentation.go:75 msg="changing probe status" status=healthy
+level=info ts=2024-03-02T19:20:57.632688547Z caller=http.go:73 service=http/server component=query msg="listening for requests and metrics" address=0.0.0.0:10902
+level=info ts=2024-03-02T19:20:57.632831025Z caller=tls_config.go:232 service=http/server component=query msg="Listening on" address=[::]:10902
+level=info ts=2024-03-02T19:20:57.632848097Z caller=tls_config.go:235 service=http/server component=query msg="TLS is disabled." http2=false address=[::]:10902
+level=info ts=2024-03-02T19:20:57.632868623Z caller=intrumentation.go:56 msg="changing probe status" status=ready
+level=info ts=2024-03-02T19:20:57.632879663Z caller=grpc.go:131 service=gRPC/server component=query msg="listening for serving gRPC" address=0.0.0.0:10901
+level=warn ts=2024-03-02T19:21:32.637418212Z caller=endpointset.go:451 component=endpointset msg="update of endpoint failed" err="getting metadata: fallback fetching info from storegateway.monitoring.svc.cluster.local:10901: rpc error: code = DeadlineExceeded desc = context deadline exceeded" address=storegateway.monitoring.svc.cluster.local:10901
+----
+level=info ts=2024-03-02T19:21:32.637490391Z caller=endpointset.go:416 component=endpointset msg="adding new sidecar with [storeEndpoints 
+rulesAPI exemplarsAPI targetsAPI MetricMetadataAPI]" address=sidecar.monitoring.svc.cluster.local:10901 extLset="{prometheus=\"monitoring/staging\", prometheus_replica=\"prometheus-staging-0\"}"
+
+level=info ts=2024-03-02T19:21:40.958367248Z caller=endpointset.go:416 component=endpointset msg="adding new store with [storeEndpoints]" 
+address=storegateway.monitoring.svc.cluster.local:10901 extLset="{prometheus=\"monitoring/staging\", prometheus_replica=\"prometheus-staging-0\"}"
+-----
+
+36. To verify mutal TLS is enabled and working properly, we can port-forwards the querier.
+# kubectl port-forward svc/querier 9090 -n monitoring
+
+To Test this we can try to query something and the request should go to the Prometheus Sidecar using TLS endpoint.
+e.g. "In dashboard 'Thanos-Query Tab will search 'prometheus_http_requests_total' "
+
+logs from Thanos-Query dashboard:--
+prometheus_http_requests_total{code="200", container="prometheus", endpoint="web", handler="/metrics", instance="10.244.0.20:9090", 
+job="prometheus-operated", namespace="monitoring", pod="prometheus-staging-0", prometheus="monitoring/staging", service="prometheus-operated"}
+
+You can also check the SIdecar container logs to see when it upload the metrics to the S3 buckets. if will 2-3 hour upload data.
+
+# [root@monitoring mycode]# kubectl logs -f prometheus-staging-0 -c thanos-sidecar -f -n monitoring
+level=info ts=2024-03-02T19:14:28.591437503Z caller=options.go:30 protocol=gRPC msg="enabling server side TLS"
+level=info ts=2024-03-02T19:14:28.591694286Z caller=options.go:66 protocol=gRPC msg="server TLS client verification enabled"
+level=info ts=2024-03-02T19:14:28.591932917Z caller=factory.go:52 msg="loading bucket configuration"
+level=info ts=2024-03-02T19:14:28.592096331Z caller=sidecar.go:363 msg="starting sidecar"
+level=info ts=2024-03-02T19:14:28.592139653Z caller=reloader.go:199 component=reloader msg="nothing to be watched"
+level=info ts=2024-03-02T19:14:28.592167055Z caller=intrumentation.go:56 msg="changing probe status" status=ready
+level=info ts=2024-03-02T19:14:28.592297842Z caller=grpc.go:131 service=gRPC/server component=sidecar msg="listening for serving gRPC" address=:10901
+level=info ts=2024-03-02T19:14:28.592310787Z caller=intrumentation.go:75 msg="changing probe status" status=healthy
+level=info ts=2024-03-02T19:14:28.592344563Z caller=http.go:73 service=http/server component=sidecar msg="listening for requests and metrics" address=:10902
+level=info ts=2024-03-02T19:14:28.592394688Z caller=tls_config.go:232 service=http/server component=sidecar msg="Listening on" address=[::]:10902
+level=info ts=2024-03-02T19:14:28.59241593Z caller=tls_config.go:235 service=http/server component=sidecar msg="TLS is disabled." http2=false address=[::]:10902
+level=info ts=2024-03-02T19:14:28.594208246Z caller=sidecar.go:179 msg="successfully loaded prometheus version"
+level=info ts=2024-03-02T19:14:28.595124472Z caller=sidecar.go:201 msg="successfully loaded prometheus external labels" external_labels="{prometheus=\"monitoring/staging\", prometheus_replica=\"prometheus-staging-0\"}"
+
+===== THIS IS ALL REQUIRED FOR THE REMOTE READ APPROACH, IF YOU WANT TO SAVE MONEY YOU CAN USE ONLY SIDECARS AND LOCAL STORAGE FOR UPTO 15 DAYS WITHOUT USING S3===
+
+
+
+

@@ -1,0 +1,112 @@
+objstoreConfig: |-
+  type: S3
+  config:
+    bucket: prometheus-metrics
+    endpoint: "minio.minio:9000"
+    insecure: true
+    access_key: "pvHKctcBPdx7yA3A"
+    secret_key: "i7rgadziYUEfXnJ5BKYX6TzshPg5NsOe"
+query:
+  enabled: true
+  args:
+    - query
+    - --log.level=info
+    - --endpoint.info-timeout=30s
+    - --grpc-address=0.0.0.0:10901
+    - --http-address=0.0.0.0:10902
+    - --query.replica-label=prometheus_replica
+    - --store=kube-prometheus-prometheus-thanos.monitoring.svc.cluster.local:10901
+    - --store=thanos-storegateway.monitoring.svc.cluster.local:10901
+    - --grpc-client-tls-secure
+    - --grpc-client-tls-cert=/certs/tls.crt
+    - --grpc-client-tls-key=/certs/tls.key
+    - --grpc-client-tls-ca=/certs/ca.crt
+  replicaCount: 1
+  extraFlags:
+    - --query.auto-downsampling
+  dnsDiscovery:
+    enabled: false
+  replicaLabel:
+    - replica
+    - prometheus_replica
+  resources:
+    limits:
+      memory: 6Gi
+      cpu: 6000m
+    requests:
+      memory: 4Gi
+      cpu: 2000m
+
+  extraVolumeMounts:
+    - name: querier-tls
+      mountPath: /certs
+    
+  extraVolumes:
+    - name: querier-tls
+      secret:
+        secretName: querier-tls
+
+bucketweb:
+  enabled: true
+compactor:
+  enabled: true
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+  retentionResolutionRaw: 60d
+  retentionResolution5m: 60d
+  retentionResolution1h: 60d
+
+storegateway:
+  enabled: true
+  args: 
+    - store
+    - --chunk-pool-size=2GB
+    - --log.level=debug
+    - --grpc-address=0.0.0.0:10901
+    - --http-address=0.0.0.0:10902
+    - --data-dir=/data
+    - --objstore.config-file=/conf/objstore.yml
+    - --grpc-server-tls-cert=/certs/tls.crt
+    - --grpc-server-tls-key=/certs/tls.key
+    - --grpc-server-tls-client-ca=/certs/ca.crt
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+  extraVolumeMounts:
+    - name: storegateway-tls
+      mountPath: /certs   
+  extraVolumes:
+    - name: storegateway-tls
+      secret:
+        secretName: storegateway-tls
+    
+ruler:
+  enabled: false
+  alertmanagers:
+    - http://rancher-monitoring-alertmanager.cattle-monitoring-system:9093/
+  config: |-
+    groups:
+      - name: "metamonitoring"
+        rules:
+        # - alert: "PrometheusDown"
+        #   expr: absent(up{prometheus="monitoring/kube-prometheus"})
+        - alert: ThanosCompactHalted
+          annotations:
+            description: Thanos Compact  has failed to run and now is halted.
+            runbook_url: https://github.com/thanos-io/thanos/tree/main/mixin/runbook.md#alert-name-thanoscompacthalted
+            summary: Thanos Compact has failed to run and is now halted.
+          expr: thanos_compact_halted{job=~".*thanos-compact.*"} == 1
+          for: 5m
+          labels:
+            severity: warning
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true

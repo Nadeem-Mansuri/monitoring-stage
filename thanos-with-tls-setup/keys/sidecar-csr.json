@@ -1,0 +1,18 @@
+{
+    "CN": "kube-prometheus-prometheus-thanos.monitoring.svc.cluster.local",
+    "hosts": [
+        "kube-prometheus-prometheus-thanos.monitoring.svc.cluster.local",
+        "kube-prometheus-prometheus-thanos.antonputra.com"
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "CA",
+            "L": "Los Banos"
+        }
+    ]
+}

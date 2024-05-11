@@ -1,0 +1,82 @@
+
+kubectl logs -f prometheus-kube-prometheus-prometheus-0  -c thanos-sidecar -f -n monitoring
+
+============== ## 
+
+##@param prometheus.secrets Secrets that should be mounted into the Prometheus Pods
+
+1118-  secrets: []
+
+    
+  ## @param prometheus.volumes Volumes allows configuration of additional volumes
+  ## ref: https://github.com/prometheus-operator/prometheus-operator/blob/master/Documentation/api.md#prometheusspec
+  ##
+  volumes: []
+
+
+    ## @param prometheus.thanos.extraVolumeMounts Additional volumeMounts from `prometheus.volumes` for thanos sidecar container
+    ## extraVolumeMounts:
+    ## - name: my-secret-volume
+    ##   mountPath: /etc/thanos/secrets/my-secret
+
+==================================================
+[root@thanos1 prometheus]# helm upgrade --install kube-prometheus --namespace=monitoring bitnami/kube-prometheus --values prometheus-values.yaml --create-namespace
+
+WARNING: Kubernetes configuration file is group-readable. This is insecure. Location: /root/.kube/config
+WARNING: Kubernetes configuration file is world-readable. This is insecure. Location: /root/.kube/config
+Release "kube-prometheus" has been upgraded. Happy Helming!
+NAME: kube-prometheus
+LAST DEPLOYED: Fri Mar  8 21:58:56 2024
+NAMESPACE: monitoring
+STATUS: deployed
+REVISION: 4
+TEST SUITE: None
+NOTES:
+CHART NAME: kube-prometheus
+CHART VERSION: 8.30.1
+APP VERSION: 0.72.0
+
+** Please be patient while the chart is being deployed **
+
+Watch the Prometheus Operator Deployment status using the command:
+
+    kubectl get deploy -w --namespace monitoring -l app.kubernetes.io/name=kube-prometheus-operator,app.kubernetes.io/instance=kube-prometheus
+
+Watch the Prometheus StatefulSet status using the command:
+
+    kubectl get sts -w --namespace monitoring -l app.kubernetes.io/name=kube-prometheus-prometheus,app.kubernetes.io/instance=kube-prometheus
+
+Prometheus can be accessed via port "9090" on the following DNS name from within your cluster:
+
+    kube-prometheus-prometheus.monitoring.svc.cluster.local
+
+To access Prometheus from outside the cluster execute the following commands:
+
+    echo "Prometheus URL: http://127.0.0.1:9090/"
+    kubectl port-forward --namespace monitoring svc/kube-prometheus-prometheus 9090:9090
+
+Thanos Sidecar can be accessed via port "10901" on the following DNS name from within your cluster:
+
+    kube-prometheus-prometheus-thanos.monitoring.svc.cluster.local
+
+Watch the Alertmanager StatefulSet status using the command:
+
+    kubectl get sts -w --namespace monitoring -l app.kubernetes.io/name=kube-prometheus-alertmanager,app.kubernetes.io/instance=kube-prometheus
+
+Alertmanager can be accessed via port "9093" on the following DNS name from within your cluster:
+
+    kube-prometheus-alertmanager.monitoring.svc.cluster.local
+
+To access Alertmanager from outside the cluster execute the following commands:
+
+    echo "Alertmanager URL: http://127.0.0.1:9093/"
+    kubectl port-forward --namespace monitoring svc/kube-prometheus-alertmanager 9093:9093
+
+WARNING: There are "resources" sections in the chart not set. Using "resourcesPreset" is not recommended for production. For production installations, please set the following values according to your workload needs:
+  - alertmanager.resources
+  - blackboxExporter.resources
+  - operator.resources
+  - prometheus.resources
+  - prometheus.thanos.resources
++info https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+

@@ -1,0 +1,7 @@
+helm upgrade --install kube-prometheus bitnami/kube-prometheus --values prometheus-values.yaml -n monitoring
+kubectl get pods -n monitoring
+cd ../thanos/
+history |grep working-values.yaml 
+helm upgrade --install thanos bitnami/thanos -n monitoring --values working-values.yaml
+kubectl get pods -n monitoring
+
