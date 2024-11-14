@@ -31,6 +31,8 @@ curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3s_VERSION} INSTALL_K3S_EX
 mkdir ~/.kube
 cp /etc/rancher/k3s/k3s.yaml .kube/config
 
+# Optional Installing Stable Version of K3S without traefik Ingress - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -s -
+
 #=Install Cert Manager==
 CERT_MANAGER_VERSION="v1.11.0"
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.crds.yaml
