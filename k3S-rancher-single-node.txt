@@ -29,7 +29,7 @@ K3s_VERSION="v1.24.8+k3s1"
 K3s_VERSION="v1.28.5+k3s1"
 curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3s_VERSION} INSTALL_K3S_EXEC='server --cluster-init --write-kubeconfig-mode=644'  sh -s -
 mkdir ~/.kube
-cp /etc/rancher/k3s/k3s.yaml .kube/config
+cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 
 # Optional Installing Stable Version of K3S without traefik Ingress - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -s -
 
