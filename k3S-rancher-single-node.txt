@@ -58,7 +58,8 @@ systemctl start docker ; systemctl enable docker ; systemctl status docker
 
 ============RANCHER NODE JOIN ERROR Solution============
 
-Set the following into its manifest file (search for dnsPolicy - it should be set to ClusterFirst; and insert the block there below that line). Please note that indendation is extremly important and must be just like in the snippet: 
+Set the following into its manifest file (search for dnsPolicy - it should be set to ClusterFirst; and insert the block there below that line). 
+Please note that indendation is extremly important and must be just like in the snippet: 
 
 hostAliases:
 - hostnames:
