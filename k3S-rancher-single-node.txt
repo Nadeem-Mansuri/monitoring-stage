@@ -33,13 +33,17 @@ cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 
 # Optional Installing Stable Version of K3S without traefik Ingress - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -s -
 
-#=Install Cert Manager==
-CERT_MANAGER_VERSION="v1.11.0"
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.crds.yaml
+#=Install Cert Manager== In Current version, Crds not required to install sepretly**
+CERT_MANAGER_VERSION="v1.17.0"
+#kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.crds.yaml
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
 helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version ${CERT_MANAGER_VERSION} --set installCRDs=true
 kubectl get pods --namespace cert-manager
+
+or
+
+helm install cert-manager jetstack/cert-manager --namespace cert-manager --create-namespace --version=1.17 --set installCRDs=true
 
 #=Install Rancher==
 helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
